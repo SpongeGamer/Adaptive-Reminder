@@ -1,0 +1,28 @@
+# --- Сборка PyInstaller ---
+build/
+dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Данные приложения (у каждого свои, в репозиторий не нужны) ---
+reminders.json
+missed_reminders.json
+settings.json
+*.json.bad
+*.json.tmp
+
+# --- Редакторы и система ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Логи ---
+*.log

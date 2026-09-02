@@ -53,7 +53,7 @@ except ImportError:
 # --- Константы -------------------------------------------------------------
 APP_NAME = "Adaptive Reminder"
 APP_TITLE = "Умные Памятки"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 DATA_FILENAME = "reminders.json"
 MISSED_FILENAME = "missed_reminders.json"
@@ -209,6 +209,7 @@ class RepeatType(Enum):
     DAILY = auto()
     WEEKLY = auto()
     MONTHLY = auto()
+    WEEKDAYS = auto()        # по выбранным дням недели (пн/ср/пт и т.п.)
 
 
 REPEAT_LABELS = {
@@ -216,7 +217,24 @@ REPEAT_LABELS = {
     RepeatType.DAILY: "Каждый день",
     RepeatType.WEEKLY: "Каждую неделю",
     RepeatType.MONTHLY: "Каждый месяц",
+    RepeatType.WEEKDAYS: "По дням недели",
 }
+
+WEEKDAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def weekdays_label(days: List[int]) -> str:
+    """[0,2,4] -> «Пн, Ср, Пт». Частые наборы называем по-человечески."""
+    if not days:
+        return "дни не выбраны"
+    ordered = sorted(set(days))
+    if ordered == [0, 1, 2, 3, 4]:
+        return "по будням"
+    if ordered == [5, 6]:
+        return "по выходным"
+    if ordered == [0, 1, 2, 3, 4, 5, 6]:
+        return "каждый день"
+    return ", ".join(WEEKDAY_SHORT[d] for d in ordered)
 
 
 @dataclass
@@ -227,6 +245,9 @@ class Reminder:
     original_time: float = field(default=None)   # когда завели (якорь повторов)
     created: float = field(default_factory=time.time)
     fired_at: Optional[float] = None             # когда реально сработало
+    weekdays: List[int] = field(default_factory=list)   # 0=Пн … 6=Вс, для WEEKDAYS
+    lead_minutes: int = 0                        # предупредить за N минут до
+    is_lead: bool = False                        # это само предупреждение
 
     def __post_init__(self):
         if self.original_time is None:
@@ -244,6 +265,9 @@ class Reminder:
             "original_time": self.original_time,
             "created": self.created,
             "fired_at": self.fired_at,
+            "weekdays": list(self.weekdays),
+            "lead_minutes": self.lead_minutes,
+            "is_lead": self.is_lead,
         }
 
     @staticmethod
@@ -264,6 +288,9 @@ class Reminder:
                 repeat_type = RepeatType.ONCE
 
         stamp = float(data.get("time", time.time()))
+        raw_days = data.get("weekdays") or []
+        weekdays = sorted({int(d) for d in raw_days if isinstance(d, (int, float))
+                           and 0 <= int(d) <= 6})
         return Reminder(
             message=str(data.get("message", "(без текста)")),
             time=stamp,
@@ -271,6 +298,9 @@ class Reminder:
             original_time=float(data.get("original_time", stamp)),
             created=float(data.get("created", stamp)),
             fired_at=data.get("fired_at"),
+            weekdays=weekdays,
+            lead_minutes=int(data.get("lead_minutes", 0) or 0),
+            is_lead=bool(data.get("is_lead", False)),
         )
 
 
@@ -456,21 +486,62 @@ class ReminderManager(QObject):
         self._write_list(self.missed_reminders, self.missed_path)
 
     # ---- операции ----
-    def add(self, message: str, when: datetime, repeat: RepeatType) -> Reminder:
+    def add(self, message: str, when: datetime, repeat: RepeatType,
+            weekdays: Optional[List[int]] = None, lead_minutes: int = 0) -> Reminder:
         stamp = when.timestamp()
-        r = Reminder(message=message, time=stamp, repeat_type=repeat, original_time=stamp)
+        r = Reminder(message=message, time=stamp, repeat_type=repeat,
+                     original_time=stamp, weekdays=sorted(set(weekdays or [])),
+                     lead_minutes=max(0, int(lead_minutes)))
+        # Если день недели у WEEKDAYS не совпал с выбранной датой — подвинем
+        # на ближайший подходящий, иначе первое срабатывание будет «не в свой день».
+        if r.repeat_type == RepeatType.WEEKDAYS and r.weekdays:
+            probe = when
+            for _ in range(8):
+                if probe.weekday() in r.weekdays and probe.timestamp() > time.time():
+                    break
+                probe += timedelta(days=1)
+            r.time = probe.timestamp()
+            r.original_time = r.time
         self.reminders.append(r)
+        self._sync_lead(r)
         self.reminders.sort(key=lambda x: x.time)
         self.save_all()
         self.changed.emit()
-        logging.info("Добавлено: %s на %s", message, when)
+        logging.info("Добавлено: %s на %s", message, datetime.fromtimestamp(r.time))
         return r
 
-    def update(self, reminder: Reminder, message: str, when: datetime, repeat: RepeatType):
+    def _sync_lead(self, reminder: Reminder):
+        """Создаёт/обновляет отдельное предупреждение «за N минут до»."""
+        self.reminders = [x for x in self.reminders
+                          if not (x.is_lead and x.message == reminder.message
+                                  and abs(x.time + x.lead_minutes * 60 - reminder.time) < 1)]
+        if reminder.is_lead or reminder.lead_minutes <= 0:
+            return
+        lead_time = reminder.time - reminder.lead_minutes * 60
+        if lead_time <= time.time():
+            return          # предупреждать уже поздно
+        warn = Reminder(
+            message=f"Через {human_duration(reminder.lead_minutes)}: {reminder.message}",
+            time=lead_time, repeat_type=RepeatType.ONCE,
+            original_time=lead_time, lead_minutes=reminder.lead_minutes, is_lead=True)
+        self.reminders.append(warn)
+
+    def update(self, reminder: Reminder, message: str, when: datetime,
+               repeat: RepeatType, weekdays: Optional[List[int]] = None,
+               lead_minutes: int = 0):
+        # старое предупреждение убираем до правки, иначе не найдём по времени
+        self.reminders = [x for x in self.reminders if not x.is_lead]
         reminder.message = message
         reminder.time = when.timestamp()
         reminder.original_time = reminder.time
         reminder.repeat_type = repeat
+        reminder.weekdays = sorted(set(weekdays or []))
+        reminder.lead_minutes = max(0, int(lead_minutes))
+        # у всех остальных напоминаний предупреждения восстановим
+        for other in list(self.reminders):
+            if other is not reminder and other.lead_minutes > 0 and not other.is_lead:
+                self._sync_lead(other)
+        self._sync_lead(reminder)
         self.reminders.sort(key=lambda x: x.time)
         self.save_all()
         self.changed.emit()
@@ -511,6 +582,20 @@ class ReminderManager(QObject):
         последнего — иначе время суток и число месяца постепенно уползают."""
         base = datetime.fromtimestamp(reminder.original_time)
         now = time.time()
+
+        if reminder.repeat_type == RepeatType.WEEKDAYS:
+            days = sorted(set(reminder.weekdays))
+            if not days:
+                return reminder.time      # дни не выбраны — считать нечего
+            # Идём вперёд по суткам, сохраняя время из original_time.
+            probe = datetime.fromtimestamp(reminder.time).replace(
+                hour=base.hour, minute=base.minute,
+                second=base.second, microsecond=0)
+            for _ in range(1, 400):
+                probe += timedelta(days=1)
+                if probe.weekday() in days and probe.timestamp() > now:
+                    return probe.timestamp()
+            return reminder.time
 
         if reminder.repeat_type == RepeatType.DAILY:
             step = timedelta(days=1)
@@ -557,6 +642,9 @@ class ReminderManager(QObject):
                 self.missed_reminders.append(record)
                 triggered.append(record)
                 reminder.time = self.next_time(reminder)
+                # для следующего срабатывания заново ставим предупреждение
+                if reminder.lead_minutes > 0:
+                    self._sync_lead(reminder)
 
         if triggered:
             self.reminders.sort(key=lambda x: x.time)
@@ -1190,9 +1278,52 @@ class AdaptiveReminderApp(QMainWindow):
         self.repeat_combo = QComboBox()
         for rt in RepeatType:
             self.repeat_combo.addItem(REPEAT_LABELS[rt], rt)
+        self.repeat_combo.currentIndexChanged.connect(self._repeat_changed)
         row.addWidget(self.datetime_input, 3)
         row.addWidget(self.repeat_combo, 2)
         layout.addLayout(row)
+
+        # Дни недели — показываются только для режима «По дням недели»
+        self.weekday_row = QWidget()
+        wd_layout = QHBoxLayout(self.weekday_row)
+        wd_layout.setContentsMargins(0, 0, 0, 0)
+        wd_layout.setSpacing(4)
+        self.weekday_boxes: List[QCheckBox] = []
+        for index, name in enumerate(WEEKDAY_SHORT):
+            box = QCheckBox(name)
+            box.setToolTip(("Понедельник", "Вторник", "Среда", "Четверг",
+                            "Пятница", "Суббота", "Воскресенье")[index])
+            box.stateChanged.connect(self._update_preview)
+            self.weekday_boxes.append(box)
+            wd_layout.addWidget(box)
+        wd_layout.addStretch(1)
+        for text, days, tip in (("Будни", [0, 1, 2, 3, 4], "Пн–Пт"),
+                                ("Вых", [5, 6], "Сб и Вс"),
+                                ("Сброс", [], "Снять все дни")):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.setMinimumWidth(52)
+            btn.setStyleSheet("QPushButton{padding:5px 8px;font-size:9pt;}")
+            btn.clicked.connect(lambda _=False, d=days: self._set_weekdays(d))
+            wd_layout.addWidget(btn)
+        self.weekday_row.hide()
+        layout.addWidget(self.weekday_row)
+
+        # Предупредить заранее
+        lead_row = QHBoxLayout()
+        lead_row.setSpacing(8)
+        self.lead_check = QCheckBox("Предупредить заранее за")
+        self.lead_check.stateChanged.connect(self._lead_toggled)
+        self.lead_spin = QSpinBox()
+        self.lead_spin.setRange(1, 1440)
+        self.lead_spin.setValue(10)
+        self.lead_spin.setSuffix(" мин")
+        self.lead_spin.setEnabled(False)
+        self.lead_spin.valueChanged.connect(self._update_preview)
+        lead_row.addWidget(self.lead_check)
+        lead_row.addWidget(self.lead_spin)
+        lead_row.addStretch(1)
+        layout.addLayout(lead_row)
 
         quick = QHBoxLayout()
         quick.setSpacing(6)
@@ -1210,6 +1341,7 @@ class AdaptiveReminderApp(QMainWindow):
 
         self.preview = QLabel()
         self.preview.setObjectName("hint")
+        self.preview.setWordWrap(True)          # длинный текст переносится, а не уезжает
         layout.addWidget(self.preview)
 
         self.submit_btn = accent_button("Создать напоминание", "#FF9800", big=True)
@@ -1316,14 +1448,67 @@ class AdaptiveReminderApp(QMainWindow):
             target = target.addDays(1)
         self.datetime_input.setDateTime(target)
 
+    def _repeat_changed(self):
+        is_weekdays = self.repeat_combo.currentData() == RepeatType.WEEKDAYS
+        self.weekday_row.setVisible(is_weekdays)
+        if is_weekdays and not self._selected_weekdays():
+            # по умолчанию отмечаем день выбранной даты
+            today = self.datetime_input.dateTime().toPython().weekday()
+            self.weekday_boxes[today].setChecked(True)
+        self._update_preview()
+
+    def _set_weekdays(self, days: List[int]):
+        for index, box in enumerate(self.weekday_boxes):
+            box.setChecked(index in days)
+
+    def _selected_weekdays(self) -> List[int]:
+        return [i for i, box in enumerate(self.weekday_boxes) if box.isChecked()]
+
+    def _lead_toggled(self):
+        self.lead_spin.setEnabled(self.lead_check.isChecked())
+        self._update_preview()
+
+    def _lead_minutes(self) -> int:
+        return self.lead_spin.value() if self.lead_check.isChecked() else 0
+
     def _update_preview(self):
         target = self.datetime_input.dateTime().toPython()
+        repeat = self.repeat_combo.currentData()
+
+        if repeat == RepeatType.WEEKDAYS:
+            days = self._selected_weekdays()
+            if not days:
+                self.preview.setText("Отметь хотя бы один день недели")
+                self.preview.setStyleSheet("color:#f44336;")
+                return
+            probe = target
+            for _ in range(8):
+                if probe.weekday() in days and probe > datetime.now():
+                    break
+                probe += timedelta(days=1)
+            text = (f"{weekdays_label(days).capitalize()} в {probe:%H:%M} · "
+                    f"ближайшее {human_until(probe)}")
+            if self._lead_minutes():
+                text += f" · предупрежу за {human_duration(self._lead_minutes())}"
+            self.preview.setText(text)
+            self.preview.setStyleSheet("color:#9b9b9b;")
+            return
+
         if target <= datetime.now():
             self.preview.setText("Время уже прошло — выбери будущее")
             self.preview.setStyleSheet("color:#f44336;")
-        else:
-            self.preview.setText("Сработает " + human_until(target))
-            self.preview.setStyleSheet("color:#9b9b9b;")
+            return
+
+        text = "Сработает " + human_until(target)
+        lead = self._lead_minutes()
+        if lead:
+            warn_at = target - timedelta(minutes=lead)
+            if warn_at > datetime.now():
+                text += f"; предупрежу в {warn_at:%H:%M}"
+            else:
+                text += "; предупредить заранее уже поздно"
+        self.preview.setText(text)
+        self.preview.setStyleSheet("color:#9b9b9b;")
 
     def set_status(self, text: str, color: str = "#9b9b9b"):
         self.status.setText(text)
@@ -1332,13 +1517,50 @@ class AdaptiveReminderApp(QMainWindow):
     # ---------- списки ----------
     def refresh_lists(self):
         self.active_list.clear()
+        today = datetime.now().date()
+        current_group = None
         for r in self.manager.reminders:
-            label = f"{r.dt:%d.%m %H:%M}   {r.message}"
-            if r.repeat_type != RepeatType.ONCE:
-                label += f"   · {REPEAT_LABELS[r.repeat_type].lower()}"
+            # Заголовок группы: Сегодня / Завтра / дата
+            day = r.dt.date()
+            delta_days = (day - today).days
+            if delta_days <= 0:
+                group = "Сегодня"
+            elif delta_days == 1:
+                group = "Завтра"
+            elif delta_days < 7:
+                # %A даёт английское название — берём русское сами
+                group = ("Понедельник", "Вторник", "Среда", "Четверг",
+                         "Пятница", "Суббота", "Воскресенье")[r.dt.weekday()]
+            else:
+                group = f"{r.dt:%d.%m.%Y}"
+            if group != current_group:
+                current_group = group
+                header = QListWidgetItem(group.upper())
+                header.setFlags(Qt.NoItemFlags)          # не выбирается
+                header.setForeground(QColor("#FF9800"))
+                font = header.font()
+                font.setBold(True)
+                font.setPointSize(max(8, font.pointSize() - 1))
+                header.setFont(font)
+                self.active_list.addItem(header)
+
+            # Без эмодзи: в списке Qt они рисуются квадратиком на части систем
+            prefix = "↑ " if r.is_lead else ""
+            label = f"    {r.dt:%H:%M}   {prefix}{r.message}"
+            marks = []
+            if r.repeat_type == RepeatType.WEEKDAYS:
+                marks.append(weekdays_label(r.weekdays))
+            elif r.repeat_type != RepeatType.ONCE:
+                marks.append(REPEAT_LABELS[r.repeat_type].lower())
+            if r.lead_minutes and not r.is_lead:
+                marks.append(f"за {human_duration(r.lead_minutes)}")
+            if marks:
+                label += "   · " + ", ".join(marks)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, r)
             item.setToolTip(f"{r.message}\n{r.dt:%d.%m.%Y %H:%M} — {human_until(r.dt)}")
+            if r.is_lead:
+                item.setForeground(QColor("#9ecbff"))
             self.active_list.addItem(item)
 
         self.missed_list.clear()
@@ -1348,7 +1570,9 @@ class AdaptiveReminderApp(QMainWindow):
             item.setData(Qt.UserRole, r)
             self.missed_list.addItem(item)
 
-        self.tabs.setTabText(0, f"Активные ({len(self.manager.reminders)})")
+        # Считаем реальные напоминания, а не строки списка (там ещё заголовки дней)
+        real_count = sum(1 for r in self.manager.reminders if not r.is_lead)
+        self.tabs.setTabText(0, f"Активные ({real_count})")
         self.tabs.setTabText(1, f"Требуют внимания ({len(self.manager.missed_reminders)})")
         self._refresh_tray()
 
@@ -1383,7 +1607,17 @@ class AdaptiveReminderApp(QMainWindow):
 
     def _selected(self, widget: QListWidget) -> Optional[Reminder]:
         item = widget.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        reminder = item.data(Qt.UserRole) if item else None
+        if reminder is not None:
+            return reminder
+        # Выделен заголовок дня (или ничего) — берём первое напоминание ниже.
+        start = widget.currentRow() + 1 if item else 0
+        for row in range(max(0, start), widget.count()):
+            candidate = widget.item(row).data(Qt.UserRole)
+            if candidate is not None:
+                widget.setCurrentRow(row)
+                return candidate
+        return None
 
     # ---------- действия ----------
     def submit(self):
@@ -1391,22 +1625,34 @@ class AdaptiveReminderApp(QMainWindow):
         when = self.datetime_input.dateTime().toPython()
         repeat = self.repeat_combo.currentData()
 
+        days = self._selected_weekdays() if repeat == RepeatType.WEEKDAYS else []
+        lead = self._lead_minutes()
+
         if not message:
             self.set_status("Введи текст напоминания", "#f44336")
             self.message_input.setFocus()
             return
-        if when <= datetime.now():
+        if repeat == RepeatType.WEEKDAYS and not days:
+            self.set_status("Отметь хотя бы один день недели", "#f44336")
+            return
+        # Для «по дням недели» прошедшее время нормально: подвинем на нужный день.
+        if repeat != RepeatType.WEEKDAYS and when <= datetime.now():
             self.set_status("Укажи время в будущем", "#f44336")
             return
 
         if self.editing is not None:
-            self.manager.update(self.editing, message, when, repeat)
-            self.set_status(f"Изменено: {message} — {when:%d.%m %H:%M}", "#4CAF50")
+            self.manager.update(self.editing, message, when, repeat, days, lead)
+            self.set_status(f"Изменено: {message}", "#4CAF50")
             self.stop_editing()
         else:
-            self.manager.add(message, when, repeat)
-            self.set_status(f"Создано: {message} — {when:%d.%m %H:%M} "
-                            f"({human_until(when)})", "#4CAF50")
+            created = self.manager.add(message, when, repeat, days, lead)
+            note = (f"Создано: {message} — {created.dt:%d.%m %H:%M} "
+                    f"({human_until(created.dt)})")
+            if days:
+                note += f", {weekdays_label(days)}"
+            if lead:
+                note += f", предупрежу за {human_duration(lead)}"
+            self.set_status(note, "#4CAF50")
             self.message_input.clear()
         self.datetime_input.setDateTime(QDateTime.currentDateTime().addSecs(900))
 
@@ -1421,6 +1667,10 @@ class AdaptiveReminderApp(QMainWindow):
         index = self.repeat_combo.findData(reminder.repeat_type)
         if index >= 0:
             self.repeat_combo.setCurrentIndex(index)
+        self._set_weekdays(reminder.weekdays)
+        self.lead_check.setChecked(reminder.lead_minutes > 0)
+        if reminder.lead_minutes > 0:
+            self.lead_spin.setValue(reminder.lead_minutes)
         self.form_title.setText("Правка напоминания")
         self.submit_btn.setText("Сохранить изменения")
         self.cancel_edit_btn.show()
@@ -1432,6 +1682,8 @@ class AdaptiveReminderApp(QMainWindow):
         self.submit_btn.setText("Создать напоминание")
         self.cancel_edit_btn.hide()
         self.message_input.clear()
+        self.lead_check.setChecked(False)
+        self._set_weekdays([])
 
     def delete_selected(self):
         reminder = self._selected(self.active_list)

@@ -56,10 +56,15 @@ win.datetime_input.setDateTime(QDateTime.currentDateTime().addSecs(3600))
 win.submit()
 check("напоминание создано", len(win.manager.reminders) == 1)
 check("поле очистилось", win.message_input.text() == "")
-check("в списке одна строка", win.active_list.count() == 1)
+# в списке теперь есть заголовки дней — считаем только напоминания
+rows = [win.active_list.item(i) for i in range(win.active_list.count())]
+real = [r for r in rows if r.data(Qt.UserRole) is not None]
+heads = [r for r in rows if r.data(Qt.UserRole) is None]
+check("одно напоминание в списке", len(real) == 1, f"{len(real)}")
+check("есть заголовок дня", len(heads) == 1, str([h.text() for h in heads]))
 check("вкладка показывает счётчик",
       "(1)" in win.tabs.tabText(0), win.tabs.tabText(0))
-print("   строка списка:", win.active_list.item(0).text())
+print("   строки:", [win.active_list.item(i).text() for i in range(win.active_list.count())])
 
 print()
 print("=" * 68)
@@ -75,7 +80,7 @@ print()
 print("=" * 68)
 print("5. РЕДАКТИРОВАНИЕ")
 print("=" * 68)
-win.active_list.setCurrentRow(0)
+win.active_list.setCurrentRow(0)   # это заголовок — код должен сам взять напоминание
 win.start_editing()
 check("форма перешла в режим правки", win.editing is not None)
 check("заголовок сменился", "Правка" in win.form_title.text(), win.form_title.text())
