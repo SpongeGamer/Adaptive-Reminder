@@ -120,10 +120,11 @@ def build() -> bool:
 
 
 def make_shortcut() -> bool:
-    """Ярлык на рабочем столе через WSH.
+    """Ярлык на рабочем столе.
 
-    Скрипт пишем в UTF-16 LE с BOM — так cscript гарантированно поймёт
-    русские буквы в путях независимо от кодовой страницы системы.
+    Пишем .ps1 в UTF-8 **с BOM**: PowerShell 5.1 без BOM читает файл как ANSI,
+    и русские буквы в имени ярлыка превращаются в мусор
+    («пшфрывгшпфшгвыарфгышаргш» вместо «Умные Памятки»).
     """
     if os.name != "nt":
         print("  [i] не Windows — ярлык пропускаем")
@@ -133,29 +134,34 @@ def make_shortcut() -> bool:
     workdir = os.path.join(HERE, "dist")
     icon_path = os.path.join(HERE, ICON)
 
-    vbs_lines = [
-        'Set sh = CreateObject("WScript.Shell")',
-        'desktop = sh.SpecialFolders("Desktop")',
-        f'Set lnk = sh.CreateShortcut(desktop & "\\{APP_NAME}.lnk")',
-        f'lnk.TargetPath = "{exe}"',
-        f'lnk.WorkingDirectory = "{workdir}"',
-        f'lnk.Description = "Умные напоминания и планировщик"',
+    ps = [
+        "$ErrorActionPreference = 'Stop'",
+        "$desktop = [Environment]::GetFolderPath('Desktop')",
+        f"$link = Join-Path $desktop '{APP_NAME}.lnk'",
+        "$shell = New-Object -ComObject WScript.Shell",
+        "$sc = $shell.CreateShortcut($link)",
+        f"$sc.TargetPath = '{exe}'",
+        f"$sc.WorkingDirectory = '{workdir}'",
+        "$sc.Description = 'Умные напоминания и планировщик'",
     ]
     if os.path.exists(icon_path):
-        vbs_lines.append(f'lnk.IconLocation = "{icon_path}"')
-    vbs_lines.append("lnk.Save")
+        ps.append(f"$sc.IconLocation = '{icon_path}'")
+    ps.append("$sc.Save()")
 
-    vbs_path = os.path.join(os.environ.get("TEMP", HERE), "_ar_shortcut.vbs")
+    ps_path = os.path.join(os.environ.get("TEMP", HERE), "_ar_shortcut.ps1")
     try:
-        with open(vbs_path, "w", encoding="utf-16") as f:   # utf-16 добавит BOM
-            f.write("\r\n".join(vbs_lines))
-        ok = run(["cscript", "//nologo", vbs_path], quiet=True)
+        # utf-8-sig = UTF-8 с BOM. Именно BOM объясняет PowerShell,
+        # что файл в UTF-8, а не в системной ANSI-кодировке.
+        with open(ps_path, "w", encoding="utf-8-sig") as f:
+            f.write("\r\n".join(ps))
+        ok = run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                  "-File", ps_path], quiet=True)
     except Exception as exc:
         print(f"  [i] ярлык создать не вышло ({exc})")
         return False
     finally:
         try:
-            os.remove(vbs_path)
+            os.remove(ps_path)
         except OSError:
             pass
 

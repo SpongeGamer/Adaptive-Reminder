@@ -3,6 +3,9 @@ build/
 dist/
 *.spec
 
+# --- Тесты: обычному пользователю не нужны ---
+tests/
+
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -10,9 +13,10 @@ __pycache__/
 .venv/
 venv/
 
-# --- Данные приложения (у каждого свои, в репозиторий не нужны) ---
+# --- Данные приложения (у каждого свои) ---
 reminders.json
 missed_reminders.json
+archive.json
 settings.json
 *.json.bad
 *.json.tmp
@@ -24,5 +28,6 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# --- Логи ---
+# --- Логи и скриншоты ---
 *.log
+shot_*.png
